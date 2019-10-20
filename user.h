@@ -24,8 +24,12 @@ char* sbrk(int);
 int sleep(int);
 int uptime(void);
 
-// TAREFA 4: Syscall para alterar a prioridade de um processo
+// TAREFA 4
 int set_prio(int);
+
+// TAREFA 5
+int wait2(int*, int*, int*);
+int proc_yield(void);
 
 // ulib.c
 int stat(const char*, struct stat*);

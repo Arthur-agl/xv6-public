@@ -20,6 +20,24 @@ extern void trapret(void);
 
 static void wakeup1(void *chan);
 
+void age(struct proc *p)
+{
+  if (p->priority == MED && (p->retime - p->prev_retime) >= TWO_THREE)
+  {
+    // Increase priority and update prev_retime
+    p->priority = HIGH;
+    p->prev_retime = p->retime;
+  }
+  else
+  {
+    if (p->priority == LOW && (p->retime - p->prev_retime) >= ONE_TWO)
+    {
+      p->priority = MED;
+      p->prev_retime = p->retime;
+    }
+  }
+}
+
 void
 pinit(void)
 {
@@ -88,16 +106,13 @@ allocproc(void)
 found:
   p->state = EMBRYO;
   p->pid = nextpid++;
-
-  //TAREFA 4: Prioridade padrão de um novo processo
-  p->priority = MED;
-
-  // TAREFA 5: Testes
+  
+  p->priority = 1;  
   p->ctime  = ticks;
   p->stime  = 0;
   p->retime = 0;
-  p->prev_retime = 0;
   p->rutime = 0;
+  p->prev_retime = 0;
 
   release(&ptable.lock);
 
@@ -220,10 +235,13 @@ fork(void)
 
   safestrcpy(np->name, curproc->name, sizeof(curproc->name));
 
-  pid = np->pid;
-  // Inicializar Prioridade
+  // TAREFA 4: Atribuir a prioridade 2 a partir de fork()
+  np->priority = MED;
 
+  pid = np->pid;
+  
   acquire(&ptable.lock);
+
 
   np->state = RUNNABLE;
 
@@ -322,6 +340,61 @@ wait(void)
   }
 }
 
+// TAREFA 5: Testes
+int
+wait2(int *retime, int *rutime, int *stime)
+{
+  struct proc *p;
+  int havekids, pid;
+  struct proc *curproc = myproc();
+  
+  acquire(&ptable.lock);
+  for(;;){
+    // Scan through table looking for exited children.
+    havekids = 0;
+    for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
+      if(p->parent != curproc)
+        continue;
+      havekids = 1;
+      if(p->state == ZOMBIE){
+        // TAREFA 5: Quando um processo ZOMBIE for encontrado, retornar seus stats antes de removê-lo da memória
+        *retime = p->retime;
+        *rutime = p->rutime;
+        *stime = p->stime; 
+
+        pid = p->pid;
+        kfree(p->kstack);
+        p->kstack = 0;
+        freevm(p->pgdir);
+        p->pid = 0;
+        p->parent = 0;
+        p->name[0] = 0;
+        p->killed = 0;
+        p->state = UNUSED;
+
+        p->ctime = 0;
+        p->retime = 0;
+        p->rutime = 0;
+        p->stime = 0;
+        p->priority = 0;
+
+        
+        release(&ptable.lock);
+        return pid;
+      }
+    }
+
+    // No point waiting if we don't have any children.
+    if(!havekids || curproc->killed){
+      release(&ptable.lock);
+      return -1;
+    }
+
+    // Wait for children to exit.  (See wakeup1 call in proc_exit.)
+    sleep(curproc, &ptable.lock);  //DOC: wait-sleep
+  }
+}
+
 //PAGEBREAK: 42
 // Per-CPU process scheduler.
 // Each CPU calls scheduler() after setting itself up.
@@ -367,90 +440,61 @@ scheduler(void)
 }*/
 
 //TAREFA 5
-void
-scheduler(void)
+void scheduler(void)
 {
   struct proc *p;
   struct cpu *c = mycpu();
   c->proc = 0;
-  
-  for(;;){
+  struct proc *p1;
+
+  for (;;)
+  {
     // Enable interrupts on this processor.
     sti();
 
     // Loop over process table looking for process to run.
     acquire(&ptable.lock);
 
-    // Para cada nivel de prioridade
-    for(int prio = 3; prio >= 1 ; prio--){
+    for (p = ptable.proc; p < &ptable.proc[NPROC]; p++)
+    {
+      //Promove p se necessario
+      age(p);
+      if (p->state != RUNNABLE)
+        continue;
+      //Achou um p pronto para executar
 
-      // Procure um processo pronto e com o nivel correto
-      // de prioridade
-      for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
-        if(p->state != RUNNABLE || p->priority != prio)
-          continue;
-
-        // Switch to chosen process.  It is the process's job
-        // to release ptable.lock and then reacquire it
-        // before jumping back to us.
-        c->proc = p;
-        switchuvm(p);
-        p->state = RUNNING;
-
-        swtch(&(c->scheduler), p->context);
-        switchkvm();
-
-        // Process is done running for now.
-        // It should have changed its p->state before coming back.
-        c->proc = 0;
+      //Acha o processo com a maior prioridade possivel que esteja RUNNABLE
+      for (p1 = p; p1 < &ptable.proc[NPROC]; p1++)
+      {
+        //Promove p1 se necessario
+        age(p1);
+        if (p1->state == RUNNABLE && p1->priority > p->priority)
+        {
+          //p agora eh o processo com maior proridade
+          p = p1;
+        }
       }
+
+      // Switch to chosen process.  It is the process's job
+      // to release ptable.lock and then reacquire it
+      // before jumping back to us.
+      c->proc = p;
+      switchuvm(p);
+      p->state = RUNNING;
+
+      swtch(&(c->scheduler), p->context);
+      switchkvm();
+
+      // Process is done running for now.
+      // It should have changed its p->state before coming back.
+      c->proc = 0;
+
+      //Break pra começar a escalonar processos do inicio da tabela
+      break;
     }
     release(&ptable.lock);
   }
 }
-
-// Loops through ptable, updating each process' execution time/sleep time/ ready time
-void updateProcs(){
-  
-  struct proc *p;
-
-  acquire(&ptable.lock);
-
-  for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
-         switch(p->state){
-           case RUNNING:
-            p->rutime++;
-
-            //TAREFA 4: Mecanismo de aging
-            if(p->priority == MED && p->retime - p->prev_retime >= TWO_THREE){
-              // Increase priority and update prev_retime
-              set_prio(HIGH);
-              p->prev_retime = p->retime;
-            }
-            else{
-              if(p->priority == LOW && p->retime - p->prev_retime >= ONE_TWO){
-                set_prio(MED);
-                p->prev_retime = p->retime;
-              }
-            }    
-
-            break;
-
-           case RUNNABLE:            
-            p->retime++;
-            break;
-            
-           case SLEEPING:
-            p->stime++;
-            break;
-           default:
-            continue;
-         }
-       } 
-
-  release(&ptable.lock);
-}
-
 
 // Enter scheduler.  Must hold only ptable.lock
 // and have changed proc->state. Saves and restores
@@ -633,21 +677,46 @@ procdump(void)
 // TAREFA 4: Syscall para alterar a prioridade de um processo
 // Chamada apenas quando um processo ceder a CPU para o escalonador
 int set_prio(int priority) {
-  
+
+  myproc()->priority = priority;
+  return 1;
+}
+
+int
+proc_yield(void)
+{
+  yield();
+  return 1;
+}
+
+// Loops through ptable, updating each process' execution time/sleep time/ ready time
+void updateProcs(){
+
   struct proc *p;
 
   acquire(&ptable.lock);
-    
-    for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
-      
-      if(p->state == RUNNING){
-        p->priority = priority;
-        break;
-      } 
-      
-    }
+
+  for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
+         switch(p->state){
+            case RUNNING:
+              p->rutime++;
+              break;
+
+            case RUNNABLE:            
+              p->retime++;
+              break;
+
+            case SLEEPING:
+              p->stime++;
+              break;
+
+            default:
+              continue;
+        }
+            
+  } 
 
   release(&ptable.lock);
-
-  return 1;
 }
+
+
